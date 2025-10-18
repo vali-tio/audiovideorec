@@ -4,7 +4,8 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Rekam Audio & Video — Single HTML</title>
-  <style>
+  <link rel="manifest" href="manifest.webmanifest">
+<style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto;max-width:900px;margin:16px auto;padding:12px}
     .controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-bottom:12px}
     label{display:block;font-size:0.9rem}
@@ -332,6 +333,11 @@ gainSlider.addEventListener('input', ()=>{
 
 // handle page visibility/unload cleanup
 window.addEventListener('beforeunload', ()=>{ if(stream) stream.getTracks().forEach(t=>t.stop()); if(animationId) cancelAnimationFrame(animationId); });
+ if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("service-worker.js")
+        .then(() => console.log("Service Worker registered"))
+        .catch(err => console.error("SW registration failed:", err));
+    }
 </script>
 </body>
 </html>
