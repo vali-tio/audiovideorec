@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Rekam Audio & Video — Single HTML</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto;max-width:900px;margin:16px auto;padding:12px}
+    .controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-bottom:12px}
+    label{display:block;font-size:0.9rem}
+    select,input[type=range]{width:100%}
+    button{padding:10px;border-radius:8px;border:1px solid #ccc;background:#f3f3f3}
+    video{width:100%;max-height:360px;background:#000}
+    canvas{width:100%;height:120px;background:#111;display:block;margin-top:8px}
+    .meter{height:8px;background:#ddd;border-radius:4px;overflow:hidden}
+    .meter > i{display:block;height:100%;width:0%;background:#4caf50}
+    .small{font-size:0.85rem;color:#555}
+    .row{display:flex;gap:8px}
+  </style>
+</head>
+<body>
+  <h1>Rekam Audio & Video (single HTML)</h1>
+  <p class="small">Fitur: pilih kamera depan/belakang, mode audio-only, pengaturan gain yang mempengaruhi waveform, dan unduh rekaman.</p>
+
+  <div class="controls">
+    <div>
+      <label>Mode</label>
+      <select id="mode">
+        <option value="av">Audio + Video</option>
+        <option value="a">Audio saja</option>
+      </select>
+    </div>
+
+    <div>
+      <label>Perangkat Kamera (atau pilih "None" untuk audio-only)</label>
+      <select id="videoSelect"></select>
+    </div>
+
+    <div>
+      <label>Input Audio</label>
+      <select id="audioSelect"></select>
+    </div>
+
+    <div>
+      <label>Gain (pengaruh pada apa yang direkam dan pada grafik)</label>
+      <input id="gain" type="range" min="0" max="4" step="0.01" value="1">
+      <div class="small">Nilai: <span id="gainVal">1.00</span></div>
+    </div>
+
+  </div>
+
+  <div class="row" style="align-items:flex-start">
+    <div style="flex:1">
+      <video id="preview" playsinline autoplay muted></video>
+      <canvas id="wave" width="1024" height="120"></canvas>
+      <div style="margin-top:6px">
+        <div class="meter"><i id="levelBar"></i></div>
+      </div>
+    </div>
+    <div style="width:220px">
+      <label>Kontrol Rekaman</label>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button id="startBtn">Start</button>
+        <button id="pauseBtn" disabled>Pause</button>
+        <button id="resumeBtn" disabled>Resume</button>
+        <button id="stopBtn" disabled>Stop</button>
+        <a id="downloadLink" style="display:none;word-break:break-all"></a>
+      </div>
+
+      <div style="margin-top:12px">
+        <label class="small">Format rekaman</label>
+        <div class="small">Browser akan menentukan MIME (WebM/ogg). Untuk distribusi APK, WebM umumnya didukung.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <hr>
+  <h3>Catatan & Packaging</h3>
+  <p class="small">Di dalam file ini ada semua kode yang diperlukan. Untuk membuat APK, salin file ini ke folder <code>www</code> pada Cordova/Capacitor, tambahkan permission Android (RECORD_AUDIO, CAMERA), lalu build. Instruksi singkat di bawah (lihat komentar di source code untuk langkah lebih lengkap):</p>
+  <ul>
+    <li>Cordova: <code>cordova create app</code> → ganti www → <code>cordova platform add android</code> → <code>cordova build android</code></li>
+    <li>Capacitor: buat proyek web, copy file ke <code>build</code>, <code>npx cap add android</code>, <code>npx cap open android</code> lalu build di Android Studio.</li>
+  </ul>
+
+<script>
+// --- Globals ---
+let audioCtx, mediaRecorder, recordedChunks = [], stream=null;
+let audioSourceNode, gainNode, analyserNode, dest;
+let animationId;
+const preview = document.getElementById('preview');
+const wave = document.getElementById('wave');
+const waveCtx = wave.getContext('2d');
+const levelBar = document.getElementById('levelBar');
+
+// UI
+const startBtn = document.getElementById('startBtn');
+const pauseBtn = document.getElementById('pauseBtn');
+const resumeBtn = document.getElementById('resumeBtn');
+const stopBtn = document.getElementById('stopBtn');
+const downloadLink = document.getElementById('downloadLink');
+const videoSelect = document.getElementById('videoSelect');
+const audioSelect = document.getElementById('audioSelect');
+const modeSelect = document.getElementById('mode');
+const gainSlider = document.getElementById('gain');
+const gainVal = document.getElementById('gainVal');
+
+async function enumerateDevices(){
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  videoSelect.innerHTML=''; audioSelect.innerHTML='';
+  const videoInputs = devices.filter(d=>d.kind==='videoinput');
+  const audioInputs = devices.filter(d=>d.kind==='audioinput');
+
+  // video: add a "none" option when audio-only selected
+  const noneOption = document.createElement('option'); noneOption.value='none'; noneOption.textContent='None (audio-only)';
+  videoSelect.appendChild(noneOption);
+
+  for(const v of videoInputs){
+    const opt = document.createElement('option'); opt.value=v.deviceId; opt.textContent=v.label || `Camera ${videoSelect.length}`;
+    videoSelect.appendChild(opt);
+  }
+  for(const a of audioInputs){
+    const opt = document.createElement('option'); opt.value=a.deviceId; opt.textContent=a.label || `Mic ${audioSelect.length}`;
+    audioSelect.appendChild(opt);
+  }
+}
+
+async function startPreview(){
+  if(stream){
+    // stop tracks
+    stream.getTracks().forEach(t=>t.stop());
+  }
+  const videoDeviceId = videoSelect.value;
+  const audioDeviceId = audioSelect.value;
+  const mode = modeSelect.value;
+
+  const constraints = { audio: audioDeviceId?{deviceId: audioDeviceId}:{}, video: false };
+  if(mode==='av' && videoDeviceId && videoDeviceId!=='none'){
+    constraints.video = { deviceId: { exact: videoDeviceId }, width: {ideal:1280}, height:{ideal:720} };
+  }
+  // create raw getUserMedia stream
+  stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+  // show video
+  if(constraints.video){
+    preview.srcObject = stream;
+    preview.play().catch(()=>{});
+  } else {
+    preview.srcObject = null;
+  }
+
+  // setup WebAudio graph
+  setupAudioGraph(stream);
+}
+
+function setupAudioGraph(inStream){
+  // cleanup
+  if(audioCtx){
+    // do not close audioCtx to keep consistent on mobile browsers
+  } else {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+
+  // If there is an existing source, disconnect
+  try{ if(audioSourceNode) audioSourceNode.disconnect(); }catch(e){}
+  try{ if(gainNode) gainNode.disconnect(); }catch(e){}
+  try{ if(analyserNode) analyserNode.disconnect(); }catch(e){}
+
+  // create source from stream (may be null if no mic)
+  const audioTracks = inStream.getAudioTracks();
+  if(audioTracks.length===0){
+    // create silent source
+    const oscillator = audioCtx.createOscillator();
+    oscillator.frequency.value = 0; oscillator.start();
+    audioSourceNode = oscillator;
+  } else {
+    audioSourceNode = audioCtx.createMediaStreamSource(inStream);
+  }
+
+  gainNode = audioCtx.createGain();
+  gainNode.gain.value = parseFloat(gainSlider.value);
+
+  analyserNode = audioCtx.createAnalyser();
+  analyserNode.fftSize = 2048;
+
+  dest = audioCtx.createMediaStreamDestination();
+
+  // connect: source -> gain -> analyser -> dest (and also to destination for monitoring if desired)
+  audioSourceNode.connect(gainNode);
+  gainNode.connect(analyserNode);
+  analyserNode.connect(dest);
+
+  // Optional: monitor through device speakers (we keep it muted to avoid feedback)
+  // gainNode.connect(audioCtx.destination);
+
+  startVisualizer();
+}
+
+function startVisualizer(){
+  const bufferLength = analyserNode.frequencyBinCount;
+  const dataArray = new Uint8Array(bufferLength);
+  waveCtx.clearRect(0,0,wave.width,wave.height);
+
+  function draw(){
+    animationId = requestAnimationFrame(draw);
+    analyserNode.getByteTimeDomainData(dataArray);
+
+    waveCtx.fillStyle = '#111';
+    waveCtx.fillRect(0,0,wave.width,wave.height);
+
+    waveCtx.lineWidth = 2;
+    waveCtx.strokeStyle = '#00ffcc';
+    waveCtx.beginPath();
+
+    const sliceWidth = wave.width / bufferLength;
+    let x=0;
+    let sum=0;
+    for(let i=0;i<bufferLength;i++){
+      const v = dataArray[i]/128.0; // 0..2
+      const y = v * (wave.height/2);
+      if(i===0) waveCtx.moveTo(x,y);
+      else waveCtx.lineTo(x,y);
+      x += sliceWidth;
+      sum += Math.abs(v-1);
+    }
+    waveCtx.stroke();
+
+    const rms = sum / bufferLength; // roughly 0..1
+    const pct = Math.min(1, rms*2);
+    levelBar.style.width = (pct*100)+'%';
+  }
+  if(animationId) cancelAnimationFrame(animationId);
+  draw();
+}
+
+async function startRecording(){
+  recordedChunks = [];
+  // combine processed audio (dest.stream) with original video tracks if any
+  let tracks = [];
+  if(stream){
+    // video tracks from preview stream
+    const vtracks = stream.getVideoTracks();
+    tracks = tracks.concat(vtracks);
+  }
+  // from audio processing dest
+  if(dest && dest.stream){
+    const processedAudioTracks = dest.stream.getAudioTracks();
+    tracks = tracks.concat(processedAudioTracks);
+  }
+
+  // create mixed stream
+  const mixedStream = new MediaStream(tracks);
+
+  // choose mime type supported
+  let options = {};
+  const mimeTypes = ['video/webm;codecs=vp8,opus','video/webm;codecs=vp9,opus','audio/webm;codecs=opus','video/mp4'];
+  for(const m of mimeTypes){ if(MediaRecorder.isTypeSupported(m)){ options.mimeType = m; break; } }
+  try{
+    mediaRecorder = new MediaRecorder(mixedStream, options);
+  }catch(e){
+    mediaRecorder = new MediaRecorder(mixedStream);
+  }
+
+  mediaRecorder.ondataavailable = e=>{ if(e.data && e.data.size>0) recordedChunks.push(e.data); };
+  mediaRecorder.onstop = e=>{ const blob = new Blob(recordedChunks, {type: mediaRecorder.mimeType || 'application/octet-stream'}); const url = URL.createObjectURL(blob); downloadLink.style.display='block'; downloadLink.href = url; downloadLink.download = (modeSelect.value==='a')? 'recording_audio.webm' : 'recording_av.webm'; downloadLink.textContent = 'Unduh: '+downloadLink.download + ' ('+Math.round(blob.size/1024)+' KB)'; };
+
+  mediaRecorder.start();
+}
+
+function stopVisualizer(){ if(animationId) cancelAnimationFrame(animationId); }
+
+// --- UI handlers ---
+startBtn.addEventListener('click', async ()=>{
+  startBtn.disabled=true; stopBtn.disabled=false; pauseBtn.disabled=false; resumeBtn.disabled=true; downloadLink.style.display='none';
+  try{
+    await startPreview();
+    await startRecording();
+  }catch(err){
+    alert('Gagal memulai rekaman: '+err.message);
+    startBtn.disabled=false; stopBtn.disabled=true; pauseBtn.disabled=true;
+  }
+});
+
+pauseBtn.addEventListener('click', ()=>{
+  if(mediaRecorder && mediaRecorder.state==='recording'){
+    mediaRecorder.pause(); pauseBtn.disabled=true; resumeBtn.disabled=false;
+  }
+});
+resumeBtn.addEventListener('click', ()=>{
+  if(mediaRecorder && mediaRecorder.state==='paused'){
+    mediaRecorder.resume(); resumeBtn.disabled=true; pauseBtn.disabled=false;
+  }
+});
+
+stopBtn.addEventListener('click', ()=>{
+  if(mediaRecorder && (mediaRecorder.state==='recording' || mediaRecorder.state==='paused')) mediaRecorder.stop();
+  stopBtn.disabled=true; startBtn.disabled=false; pauseBtn.disabled=true; resumeBtn.disabled=true;
+
+  // stop tracks of original stream
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  // stop visualizer
+  stopVisualizer();
+});
+
+// handle device selection changes
+videoSelect.addEventListener('change', async ()=>{ await startPreview(); });
+audioSelect.addEventListener('change', async ()=>{ await startPreview(); });
+modeSelect.addEventListener('change', async ()=>{ await startPreview(); });
+
+// gain control
+gainSlider.addEventListener('input', ()=>{
+  gainVal.textContent = parseFloat(gainSlider.value).toFixed(2);
+  if(gainNode) gainNode.gain.value = parseFloat(gainSlider.value);
+});
+
+// initial setup
+(async ()=>{
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    alert('Browser Anda tidak mendukung media capture (getUserMedia). Gunakan Chrome/Edge/Firefox terbaru.');
+    return;
+  }
+  try{
+    // request permissions briefly to get device labels
+    await navigator.mediaDevices.getUserMedia({audio:true, video:true}).then(s=>{ s.getTracks().forEach(t=>t.stop()); });
+  }catch(e){ /* ignore - user might deny, still enumerate devices but labels may be blank */ }
+  await enumerateDevices();
+  // choose defaults
+  if(videoSelect.options.length>1) videoSelect.selectedIndex = 1;
+  if(audioSelect.options.length>0) audioSelect.selectedIndex = 0;
+  gainVal.textContent = gainSlider.value;
+})();
+
+// handle page visibility/unload cleanup
+window.addEventListener('beforeunload', ()=>{ if(stream) stream.getTracks().forEach(t=>t.stop()); if(animationId) cancelAnimationFrame(animationId); });
+</script>
+</body>
+</html>
